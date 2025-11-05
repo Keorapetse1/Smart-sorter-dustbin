@@ -1,38 +1,13 @@
 #include <Theo1-project-1_inferencing.h>
 #include "edge-impulse-sdk/dsp/image/image.hpp"
-
 #include "esp_camera.h"
-#include <HardwareSerial.h>
-HardwareSerial WroomSerial(1);
+#include <esp_now.h>
+#include <WiFi.h>
 
-// Select camera model - find more camera models in camera_pins.h file here
-// https://github.com/espressif/arduino-esp32/blob/master/libraries/ESP32/examples/Camera/CameraWebServer/camera_pins.h
-
-#define TX_CAM 14
-#define BAUDRATE 115200
-//#define CAMERA_MODEL_ESP_EYE // Has PSRAM
+// Select camera model
 #define CAMERA_MODEL_AI_THINKER // Has PSRAM
 
-#if defined(CAMERA_MODEL_ESP_EYE)
-#define PWDN_GPIO_NUM    -1
-#define RESET_GPIO_NUM   -1
-#define XCLK_GPIO_NUM    4
-#define SIOD_GPIO_NUM    18
-#define SIOC_GPIO_NUM    23
-
-#define Y9_GPIO_NUM      36
-#define Y8_GPIO_NUM      37
-#define Y7_GPIO_NUM      38
-#define Y6_GPIO_NUM      39
-#define Y5_GPIO_NUM      35
-#define Y4_GPIO_NUM      14
-#define Y3_GPIO_NUM      13
-#define Y2_GPIO_NUM      34
-#define VSYNC_GPIO_NUM   5
-#define HREF_GPIO_NUM    27
-#define PCLK_GPIO_NUM    25
-
-#elif defined(CAMERA_MODEL_AI_THINKER)
+#if defined(CAMERA_MODEL_AI_THINKER)
 #define PWDN_GPIO_NUM     32
 #define RESET_GPIO_NUM    -1
 #define XCLK_GPIO_NUM      0
@@ -50,9 +25,6 @@ HardwareSerial WroomSerial(1);
 #define VSYNC_GPIO_NUM    25
 #define HREF_GPIO_NUM     23
 #define PCLK_GPIO_NUM     22
-
-#else
-#error "Camera model not selected"
 #endif
 
 /* Constant defines -------------------------------------------------------- */
@@ -60,10 +32,33 @@ HardwareSerial WroomSerial(1);
 #define EI_CAMERA_RAW_FRAME_BUFFER_ROWS           240
 #define EI_CAMERA_FRAME_BYTE_SIZE                 3
 
+/* ESP-NOW Configuration */
+uint8_t slaveMac[] = {0x4c, 0x11, 0xae, 0x7d, 0xaf, 0xf4}; // REPLACE WITH YOUR WROOM32 MAC
+
+// Message structure for ESP-NOW
+typedef struct struct_message {
+  char command[20];
+  char label[20];
+  float confidence;
+  uint32_t timestamp;
+  uint8_t object_count;
+} struct_message;
+
+struct_message detectionData;
+
+// ESP-NOW callbacks
+void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
+  Serial.print("Last Packet Send Status: ");
+  Serial.println(status == ESP_NOW_SEND_SUCCESS ? "Delivery Success" : "Delivery Fail");
+}
+
 /* Private variables ------------------------------------------------------- */
-static bool debug_nn = false; // Set this to true to see e.g. features generated from the raw signal
+static bool debug_nn = false;
 static bool is_initialised = false;
-uint8_t *snapshot_buf; //points to the output of the capture
+uint8_t *snapshot_buf;
+unsigned long lastDetectionTime = 0;
+const unsigned long DETECTION_COOLDOWN = 5000;
+const unsigned long LOOP_DELAY = 3000;
 
 static camera_config_t camera_config = {
     .pin_pwdn = PWDN_GPIO_NUM,
@@ -84,75 +79,230 @@ static camera_config_t camera_config = {
     .pin_href = HREF_GPIO_NUM,
     .pin_pclk = PCLK_GPIO_NUM,
 
-    //XCLK 20MHz or 10MHz for OV2640 double FPS (Experimental)
     .xclk_freq_hz = 20000000,
     .ledc_timer = LEDC_TIMER_0,
     .ledc_channel = LEDC_CHANNEL_0,
 
-    .pixel_format = PIXFORMAT_JPEG, //YUV422,GRAYSCALE,RGB565,JPEG
-    .frame_size = FRAMESIZE_QQVGA,    //QQVGA-UXGA Do not use sizes above QVGA when not JPEG
-
-    .jpeg_quality = 12, //0-63 lower number means higher quality
-    .fb_count = 1,       //if more than one, i2s runs in continuous mode. Use only with JPEG
+    .pixel_format = PIXFORMAT_JPEG,
+    .frame_size = FRAMESIZE_QVGA,
+    .jpeg_quality = 12,
+    .fb_count = 1,
     .fb_location = CAMERA_FB_IN_PSRAM,
     .grab_mode = CAMERA_GRAB_WHEN_EMPTY,
 };
 
-/* Function definitions ------------------------------------------------------- */
+// Forward declarations
 bool ei_camera_init(void);
 void ei_camera_deinit(void);
-bool ei_camera_capture(uint32_t img_width, uint32_t img_height, uint8_t *out_buf) ;
+bool ei_camera_capture(uint32_t img_width, uint32_t img_height, uint8_t *out_buf);
+static int ei_camera_get_data(size_t offset, size_t length, float *out_ptr);
+void setupESP_NOW();
+void sendDetection(const char* label, float confidence, uint8_t count);
+bool initializeCameraWithRetry();
 
-// Function to send command to ESP32-WROOM32
-void sendCommandToWroom(const char* material) {
-  WroomSerial.println(material);   // Send the message
-  Serial.print("Sent to WROOM32: ");
-  Serial.println(material);
-  delay(50);
-}
 /**
-* @brief      Arduino setup function
+* Camera initialization function
 */
-void setup()
-{
-    // put your setup code here, to run once:
-    Serial.begin(115200);
-    // Initialize TX-only serial link to ESP32-WROOM32
-WroomSerial.begin(BAUDRATE, SERIAL_8N1, -1, TX_CAM);  // TX only, no RX
-delay(50);
-Serial.println("ESP32-CAM ready to send material commands...");
-    //comment out the below line to start inference immediately after upload
-    while (!Serial);
-    Serial.println("Edge Impulse Inferencing Demo");
-    if (ei_camera_init() == false) {
-        ei_printf("Failed to initialize Camera!\r\n");
-    }
-    else {
-        ei_printf("Camera initialized\r\n");
+bool ei_camera_init(void) {
+    if (is_initialised) return true;
+
+    // Initialize the camera
+    esp_err_t err = esp_camera_init(&camera_config);
+    if (err != ESP_OK) {
+        Serial.printf("Camera init failed with error 0x%x\n", err);
+        return false;
     }
 
-    ei_printf("\nStarting continious inference in 2 seconds...\n");
-    ei_sleep(2000);
+    sensor_t *s = esp_camera_sensor_get();
+    if (s->id.PID == OV3660_PID) {
+        s->set_vflip(s, 1);
+        s->set_brightness(s, 1);
+        s->set_saturation(s, 0);
+    }
+
+    is_initialised = true;
+    return true;
 }
 
 /**
-* @brief      Get data and run inferencing
-*
-* @param[in]  debug  Get debug info if true
+* Camera deinitialization
 */
-void loop()
-{
-Serial.printf("Free heap: %d bytes\n", ESP.getFreeHeap());
-    // instead of wait_ms, we'll wait on the signal, this allows threads to cancel us...
-    if (ei_sleep(5) != EI_IMPULSE_OK) {
+void ei_camera_deinit(void) {
+    esp_err_t err = esp_camera_deinit();
+    if (err != ESP_OK) {
+        Serial.println("Camera deinit failed");
         return;
     }
+    is_initialised = false;
+}
 
-    static uint8_t snapshot_buf[EI_CAMERA_RAW_FRAME_BUFFER_COLS * EI_CAMERA_RAW_FRAME_BUFFER_ROWS * EI_CAMERA_FRAME_BYTE_SIZE];
+/**
+* Camera capture function
+*/
+bool ei_camera_capture(uint32_t img_width, uint32_t img_height, uint8_t *out_buf) {
+    if (!is_initialised) {
+        Serial.println("ERR: Camera is not initialized");
+        return false;
+    }
 
-    // check if allocation was successful
+    camera_fb_t *fb = esp_camera_fb_get();
+    if (!fb) {
+        Serial.println("Camera capture failed");
+        return false;
+    }
+
+    bool converted = fmt2rgb888(fb->buf, fb->len, PIXFORMAT_JPEG, snapshot_buf);
+    esp_camera_fb_return(fb);
+
+    if (!converted) {
+        Serial.println("Conversion failed");
+        return false;
+    }
+
+    if ((img_width != EI_CAMERA_RAW_FRAME_BUFFER_COLS) || (img_height != EI_CAMERA_RAW_FRAME_BUFFER_ROWS)) {
+        ei::image::processing::crop_and_interpolate_rgb888(
+            out_buf,
+            EI_CAMERA_RAW_FRAME_BUFFER_COLS,
+            EI_CAMERA_RAW_FRAME_BUFFER_ROWS,
+            out_buf,
+            img_width,
+            img_height);
+    }
+
+    return true;
+}
+
+/**
+* Get camera data for Edge Impulse
+*/
+static int ei_camera_get_data(size_t offset, size_t length, float *out_ptr) {
+    size_t pixel_ix = offset * 3;
+    size_t pixels_left = length;
+    size_t out_ptr_ix = 0;
+
+    while (pixels_left != 0) {
+        out_ptr[out_ptr_ix] = (snapshot_buf[pixel_ix + 2] << 16) + (snapshot_buf[pixel_ix + 1] << 8) + snapshot_buf[pixel_ix];
+        out_ptr_ix++;
+        pixel_ix += 3;
+        pixels_left--;
+    }
+    return 0;
+}
+
+/**
+* Setup function
+*/
+void setup() {
+    Serial.begin(115200);
+    Serial.println();
+    Serial.println("=== Smart Bin ESP32-CAM Starting ===");
+    
+    delay(2000);
+    
+    setupESP_NOW();
+
+    if (!initializeCameraWithRetry()) {
+        Serial.println("CRITICAL: Camera initialization failed!");
+        while(1) {
+            delay(1000);
+            Serial.println("System halted - Check camera connection");
+        }
+    }
+
+    Serial.println("✓ All systems ready");
+    Serial.println("=====================================");
+    delay(2000);
+}
+
+/**
+* Initialize camera with retry mechanism
+*/
+bool initializeCameraWithRetry() {
+    int retryCount = 0;
+    const int maxRetries = 5;
+    
+    while (retryCount < maxRetries) {
+        Serial.print("Camera initialization attempt ");
+        Serial.print(retryCount + 1);
+        Serial.print("/");
+        Serial.println(maxRetries);
+        
+        if (ei_camera_init()) {
+            return true;
+        }
+        
+        retryCount++;
+        delay(2000);
+    }
+    return false;
+}
+
+/**
+* Initialize ESP-NOW
+*/
+void setupESP_NOW() {
+    Serial.println("Initializing ESP-NOW...");
+    
+    WiFi.mode(WIFI_STA);
+    
+    if (esp_now_init() != ESP_OK) {
+        Serial.println("Error initializing ESP-NOW");
+        return;
+    }
+    
+    esp_now_register_send_cb((esp_now_send_cb_t)OnDataSent);
+    
+    esp_now_peer_info_t peerInfo;
+    memset(&peerInfo, 0, sizeof(peerInfo));
+    memcpy(peerInfo.peer_addr, slaveMac, 6);
+    peerInfo.channel = 0;  
+    peerInfo.encrypt = false;
+    
+    if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+        Serial.println("Failed to add peer");
+        return;
+    }
+    
+    Serial.println("✓ ESP-NOW Initialized");
+}
+
+/**
+* Send detection via ESP-NOW
+*/
+void sendDetection(const char* label, float confidence, uint8_t count) {
+    strncpy(detectionData.command, "OBJECT_DETECTED", sizeof(detectionData.command));
+    strncpy(detectionData.label, label, sizeof(detectionData.label));
+    detectionData.confidence = confidence;
+    detectionData.timestamp = millis();
+    detectionData.object_count = count;
+    
+    Serial.print("Sending detection: ");
+    Serial.print(label);
+    Serial.print(" (");
+    Serial.print(confidence * 100);
+    Serial.println("%)");
+    
+    esp_err_t result = esp_now_send(slaveMac, (uint8_t *) &detectionData, sizeof(detectionData));
+    
+    if (result == ESP_OK) {
+        Serial.println("✓ Detection sent successfully");
+    } else {
+        Serial.println("✗ Error sending detection");
+    }
+}
+
+/**
+* Main loop
+*/
+void loop() {
+    Serial.println();
+    Serial.println("=== Starting new detection cycle ===");
+    delay(LOOP_DELAY);
+
+    snapshot_buf = (uint8_t*)malloc(EI_CAMERA_RAW_FRAME_BUFFER_COLS * EI_CAMERA_RAW_FRAME_BUFFER_ROWS * EI_CAMERA_FRAME_BYTE_SIZE);
+
     if(snapshot_buf == nullptr) {
-        ei_printf("ERR: Failed to allocate snapshot buffer!\n");
+        Serial.println("✗ ERR: Failed to allocate snapshot buffer!");
         return;
     }
 
@@ -161,242 +311,81 @@ Serial.printf("Free heap: %d bytes\n", ESP.getFreeHeap());
     signal.get_data = &ei_camera_get_data;
 
     if (ei_camera_capture((size_t)EI_CLASSIFIER_INPUT_WIDTH, (size_t)EI_CLASSIFIER_INPUT_HEIGHT, snapshot_buf) == false) {
-        ei_printf("Failed to capture image\r\n");
+        Serial.println("✗ Failed to capture image");
         free(snapshot_buf);
         return;
     }
 
-    // Run the classifier
-    ei_impulse_result_t result = { 0 };
+    Serial.println("✓ Image captured successfully");
 
+    ei_impulse_result_t result = { 0 };
     EI_IMPULSE_ERROR err = run_classifier(&signal, &result, debug_nn);
+    
     if (err != EI_IMPULSE_OK) {
-        ei_printf("ERR: Failed to run classifier (%d)\n", err);
+        Serial.print("✗ ERR: Failed to run classifier (");
+        Serial.print(err);
+        Serial.println(")");
+        free(snapshot_buf);
         return;
     }
 
-    // print the predictions
-    ei_printf("Predictions (DSP: %d ms., Classification: %d ms., Anomaly: %d ms.): \n",
-                result.timing.dsp, result.timing.classification, result.timing.anomaly);
+    Serial.println("✓ Classification completed");
+
+    bool objectDetected = false;
+    uint8_t detectedCount = 0;
+    char detectedLabel[20] = "";
+    float maxConfidence = 0.0;
 
 #if EI_CLASSIFIER_OBJECT_DETECTION == 1
-    ei_printf("Object detection bounding boxes:\r\n");
+    Serial.println("Object detection results:");
     for (uint32_t i = 0; i < result.bounding_boxes_count; i++) {
         ei_impulse_result_bounding_box_t bb = result.bounding_boxes[i];
         if (bb.value == 0) {
             continue;
         }
-        ei_printf("  %s (%f) [ x: %u, y: %u, width: %u, height: %u ]\r\n",
-                bb.label,
-                bb.value,
-                bb.x,
-                bb.y,
-                bb.width,
-                bb.height);
-    }
-
-    // Print the prediction results (classification)
-#else
-    ei_printf("Predictions:\r\n");
-    for (uint16_t i = 0; i < EI_CLASSIFIER_LABEL_COUNT; i++) {
-        ei_printf("  %s: ", ei_classifier_inferencing_categories[i]);
-        ei_printf("%.5f\r\n", result.classification[i].value);
-    }
-#endif
-
-// === DECISION & COMMAND SENDING SECTION ===
-float woodProb = 0.0, plasticProb = 0.0, paperProb = 0.0;
-
-for (uint16_t i = 0; i < EI_CLASSIFIER_LABEL_COUNT; i++) {
-    if (strcmp(result.classification[i].label, "wood") == 0) {
-        woodProb = result.classification[i].value;
-    } else if (strcmp(result.classification[i].label, "plastic") == 0) {
-        plasticProb = result.classification[i].value;
-    } else if (strcmp(result.classification[i].label, "paper") == 0) {
-        paperProb = result.classification[i].value;
-    }
-}
-
-Serial.printf("wood: %.2f, plastic: %.2f, paper: %.2f\n", woodProb, plasticProb, paperProb);
-
-if (woodProb > 0.80 && woodProb > plasticProb && woodProb > paperProb) {
-    sendCommandToWroom("WOOD");
-    delay(10);
-    yield();
-} 
-else if (plasticProb > 0.80 && plasticProb > woodProb && plasticProb > paperProb) {
-    sendCommandToWroom("PLASTIC");
-    delay(10);
-    yield();
-} 
-else if (paperProb > 0.80 && paperProb > woodProb && paperProb > plasticProb) {
-    sendCommandToWroom("PAPER");
-    delay(10);
-    yield();
-}
-
-else {
-    // Optional: sendCommandToWroom("IDLE");
-}
-delay(10);
-yield();
-
-    // Print anomaly result (if it exists)
-#if EI_CLASSIFIER_HAS_ANOMALY
-    ei_printf("Anomaly prediction: %.3f\r\n", result.anomaly);
-#endif
-
-#if EI_CLASSIFIER_HAS_VISUAL_ANOMALY
-    ei_printf("Visual anomalies:\r\n");
-    for (uint32_t i = 0; i < result.visual_ad_count; i++) {
-        ei_impulse_result_bounding_box_t bb = result.visual_ad_grid_cells[i];
-        if (bb.value == 0) {
-            continue;
+        Serial.print("  ");
+        Serial.print(bb.label);
+        Serial.print(" (");
+        Serial.print(bb.value * 100, 1);
+        Serial.println("%)");
+        
+        if (bb.value > maxConfidence && bb.value > 0.7) {
+            objectDetected = true;
+            detectedCount++;
+            strncpy(detectedLabel, bb.label, sizeof(detectedLabel));
+            maxConfidence = bb.value;
         }
-  ei_printf("  [Anomaly value: %f, x: %u, y: %u, w: %u, h: %u]\r\n", bb.value, bb.x, bb.y, bb.width, bb.height);
-}
-
+    }
+#else
+    Serial.println("Classification results:");
+    for (uint16_t i = 0; i < EI_CLASSIFIER_LABEL_COUNT; i++) {
+        Serial.print("  ");
+        Serial.print(ei_classifier_inferencing_categories[i]);
+        Serial.print(": ");
+        Serial.println(result.classification[i].value, 5);
+        
+        if (result.classification[i].value > 0.7 && result.classification[i].value > maxConfidence) {
+            objectDetected = true;
+            strncpy(detectedLabel, ei_classifier_inferencing_categories[i], sizeof(detectedLabel));
+            maxConfidence = result.classification[i].value;
+        }
+    }
 #endif
 
+    if (objectDetected) {
+        if (millis() - lastDetectionTime > DETECTION_COOLDOWN) {
+            Serial.println("✓ Sending detection via ESP-NOW");
+            sendDetection(detectedLabel, maxConfidence, detectedCount);
+            lastDetectionTime = millis();
+        } else {
+            Serial.println("⏳ Detection cooldown active - skipping send");
+        }
+    } else {
+        Serial.println("ℹ️ No confident objects detected");
+    }
 
     free(snapshot_buf);
-
-}
-
-/**
- * @brief   Setup image sensor & start streaming
- *
- * @retval  false if initialisation failed
- */
-bool ei_camera_init(void) {
-
-    if (is_initialised) return true;
-
-#if defined(CAMERA_MODEL_ESP_EYE)
-  pinMode(13, INPUT_PULLUP);
-  pinMode(14, INPUT_PULLUP);
-#endif
-
-    //initialize the camera
-    esp_err_t err = esp_camera_init(&camera_config);
-    if (err != ESP_OK) {
-      Serial.printf("Camera init failed with error 0x%x\n", err);
-      return false;
-    }
-
-    sensor_t * s = esp_camera_sensor_get();
-    // initial sensors are flipped vertically and colors are a bit saturated
-    if (s->id.PID == OV3660_PID) {
-      s->set_vflip(s, 1); // flip it back
-      s->set_brightness(s, 1); // up the brightness just a bit
-      s->set_saturation(s, 0); // lower the saturation
-    }
-
-#if defined(CAMERA_MODEL_M5STACK_WIDE)
-    s->set_vflip(s, 1);
-    s->set_hmirror(s, 1);
-#elif defined(CAMERA_MODEL_ESP_EYE)
-    s->set_vflip(s, 1);
-    s->set_hmirror(s, 1);
-    s->set_awb_gain(s, 1);
-#endif
-
-    is_initialised = true;
-    return true;
-}
-
-/**
- * @brief      Stop streaming of sensor data
- */
-void ei_camera_deinit(void) {
-
-    //deinitialize the camera
-    esp_err_t err = esp_camera_deinit();
-
-    if (err != ESP_OK)
-    {
-        ei_printf("Camera deinit failed\n");
-        return;
-    }
-
-    is_initialised = false;
-    return;
-}
-
-
-/**
- * @brief      Capture, rescale and crop image
- *
- * @param[in]  img_width     width of output image
- * @param[in]  img_height    height of output image
- * @param[in]  out_buf       pointer to store output image, NULL may be used
- *                           if ei_camera_frame_buffer is to be used for capture and resize/cropping.
- *
- * @retval     false if not initialised, image captured, rescaled or cropped failed
- *
- */
-bool ei_camera_capture(uint32_t img_width, uint32_t img_height, uint8_t *out_buf) {
-    bool do_resize = false;
-
-    if (!is_initialised) {
-        ei_printf("ERR: Camera is not initialized\r\n");
-        return false;
-    }
-
-    camera_fb_t *fb = esp_camera_fb_get();
-
-    if (!fb) {
-        ei_printf("Camera capture failed\n");
-        return false;
-    }
-
-   bool converted = fmt2rgb888(fb->buf, fb->len, PIXFORMAT_JPEG, snapshot_buf);
-
-   esp_camera_fb_return(fb);
-
-   if(!converted){
-       ei_printf("Conversion failed\n");
-       return false;
-   }
-
-    if ((img_width != EI_CAMERA_RAW_FRAME_BUFFER_COLS)
-        || (img_height != EI_CAMERA_RAW_FRAME_BUFFER_ROWS)) {
-        do_resize = true;
-    }
-
-    if (do_resize) {
-        ei::image::processing::crop_and_interpolate_rgb888(
-        out_buf,
-        EI_CAMERA_RAW_FRAME_BUFFER_COLS,
-        EI_CAMERA_RAW_FRAME_BUFFER_ROWS,
-        out_buf,
-        img_width,
-        img_height);
-    }
-
-
-    return true;
-}
-
-static int ei_camera_get_data(size_t offset, size_t length, float *out_ptr)
-{
-    // we already have a RGB888 buffer, so recalculate offset into pixel index
-    size_t pixel_ix = offset * 3;
-    size_t pixels_left = length;
-    size_t out_ptr_ix = 0;
-
-    while (pixels_left != 0) {
-        // Swap BGR to RGB here
-        // due to https://github.com/espressif/esp32-camera/issues/379
-        out_ptr[out_ptr_ix] = (snapshot_buf[pixel_ix + 2] << 16) + (snapshot_buf[pixel_ix + 1] << 8) + snapshot_buf[pixel_ix];
-
-        // go to the next pixel
-        out_ptr_ix++;
-        pixel_ix+=3;
-        pixels_left--;
-    }
-    // and done!
-    return 0;
+    Serial.println("=== Detection cycle completed ===");
 }
 
 #if !defined(EI_CLASSIFIER_SENSOR) || EI_CLASSIFIER_SENSOR != EI_CLASSIFIER_SENSOR_CAMERA
